@@ -1,6 +1,22 @@
-# .github/workflows/ci-cd.yml
+# =================================================================
+# CI/CD PIPELINE — RecSys RetailRocket
+# =================================================================
+# Flow:
+#   Push code → Tests → Detect file changes → Build ONLY changed images → Push ECR
+#
+# 3 images:
+#   recsys-train   → Kubeflow pull để train models
+#   recsys-feature → Lambda/Airflow pull để clean data + compute features
+#   recsys-serve   → EKS pull để serve API 24/7
+# =================================================================
+
 name: CI/CD Pipeline
 
+# -----------------------------------------------------------------
+# KHI NÀO CHẠY
+# push main: chạy full (test + build + push)
+# pull_request: chỉ chạy test (review code trước khi merge)
+# -----------------------------------------------------------------
 on:
   push:
     branches: [main]
@@ -8,6 +24,13 @@ on:
     branches: [main]
 
 jobs:
+  # ===============================================================
+  # JOB 1: TEST
+  # Chạy MỌI LẦN push hoặc PR
+  # Install torch(cpu) 200MB thay vì 2GB — đủ cho tests, không cần GPU
+  # 39 tests: API + import + logic + shape
+  # Fail → dừng, không build, không push
+  # ===============================================================
   test:
     runs-on: ubuntu-latest
     steps:
@@ -17,19 +40,72 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install ALL dependencies
+      - name: Install dependencies
         run: |
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install gensim faiss-cpu lightgbm
           pip install fastapi httpx uvicorn pytest pandas numpy scikit-learn
 
-      - name: Run ALL tests
+      - name: Run all tests
         run: python -m pytest tests/ -v --tb=short
 
-  build-and-push:
+  # ===============================================================
+  # JOB 2: DETECT CHANGES
+  # So sánh commit hiện tại vs commit trước → file nào đổi?
+  # Output 3 boolean: train_changed, feature_changed, serve_changed
+  # Jobs sau đọc output này để quyết định build hay skip
+  # ===============================================================
+  detect-changes:
     runs-on: ubuntu-latest
     needs: test
-    if: github.event_name == 'push' && needs.test.result == 'success'
+    if: github.event_name == 'push'
+    outputs:
+      train_changed: ${{ steps.check.outputs.train_changed }}
+      feature_changed: ${{ steps.check.outputs.feature_changed }}
+      serve_changed: ${{ steps.check.outputs.serve_changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect which code changed
+        id: check
+        run: |
+          CHANGED=$(git diff --name-only HEAD~1 HEAD)
+          echo "Changed files:"
+          echo "$CHANGED"
+
+          # src/model_* hoặc configs/ hoặc Dockerfile.train đổi → rebuild training image
+          if echo "$CHANGED" | grep -qE "^src/model_|^configs/|^Dockerfile.train|^requirements-train"; then
+            echo "train_changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "train_changed=false" >> $GITHUB_OUTPUT
+          fi
+
+          # src/feature_engineer/ hoặc src/data_pipeline/ đổi → rebuild feature image
+          if echo "$CHANGED" | grep -qE "^src/feature_engineer/|^src/data_pipeline/|^Dockerfile.feature|^requirements-feature"; then
+            echo "feature_changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "feature_changed=false" >> $GITHUB_OUTPUT
+          fi
+
+          # api_gateway/ hoặc id_mapper đổi → rebuild serving image
+          if echo "$CHANGED" | grep -qE "^api_gateway/|^src/id_mapper"; then
+            echo "serve_changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "serve_changed=false" >> $GITHUB_OUTPUT
+          fi
+
+  # ===============================================================
+  # JOB 3: BUILD TRAINING IMAGE
+  # CHỈ CHẠY khi training code thay đổi
+  # Image chứa: model training code + torch + gensim + lightgbm
+  # Kubeflow pull image này khi cần retrain
+  # ===============================================================
+  build-train:
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.train_changed == 'true'
     steps:
       - uses: actions/checkout@v4
 
@@ -37,26 +113,69 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ap-southeast-1
+          aws-region: ${{ secrets.AWS_REGION }}
 
       - uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build & Push
+      - name: Build and push training image
         run: |
           TAG=$(git rev-parse --short HEAD)
           docker build -f Dockerfile.train -t ${{ secrets.ECR_REGISTRY }}/recsys-train:$TAG .
-          docker build -f api_gateway/Dockerfile -t ${{ secrets.ECR_REGISTRY }}/recsys-serve:$TAG .
           docker push ${{ secrets.ECR_REGISTRY }}/recsys-train:$TAG
+          echo "Pushed recsys-train:$TAG"
+
+  # ===============================================================
+  # JOB 4: BUILD FEATURE IMAGE
+  # CHỈ CHẠY khi feature/data pipeline code thay đổi
+  # Image chứa: data cleaning + feature computation code + pandas + feast
+  # Lambda/Airflow pull image này khi cần recompute features
+  # ===============================================================
+  build-feature:
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.feature_changed == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push feature image
+        run: |
+          TAG=$(git rev-parse --short HEAD)
+          docker build -f Dockerfile.feature -t ${{ secrets.ECR_REGISTRY }}/recsys-feature:$TAG .
+          docker push ${{ secrets.ECR_REGISTRY }}/recsys-feature:$TAG
+          echo "Pushed recsys-feature:$TAG"
+
+  # ===============================================================
+  # JOB 5: BUILD SERVING IMAGE
+  # CHỈ CHẠY khi serving code thay đổi
+  # Image chứa: FastAPI + lightgbm + faiss (nhẹ, không có torch)
+  # EKS pull image này, chạy 24/7 serve users
+  # ===============================================================
+  build-serve:
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.serve_changed == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push serving image
+        run: |
+          TAG=$(git rev-parse --short HEAD)
+          docker build -f api_gateway/Dockerfile -t ${{ secrets.ECR_REGISTRY }}/recsys-serve:$TAG .
           docker push ${{ secrets.ECR_REGISTRY }}/recsys-serve:$TAG
-```
-
-Trick: `--index-url https://download.pytorch.org/whl/cpu` install torch **CPU-only** = 200MB thay vì 2GB. Tests không cần GPU.
-
-### Flow:
-```
-Local (conda env):
-  39 tests ALL RUN → 0 failed → push code
-
-GitHub Actions:
-  Install torch(cpu) + gensim + faiss (~3 phút)
-  39 tests ALL RUN → 0 failed → build images → push ECR
+          echo "Pushed recsys-serve:$TAG"
