@@ -1,0 +1,8 @@
+fastapi==0.104.0      ← web framework nhận HTTP requests
+uvicorn==0.24.0       ← ASGI server chạy FastAPI
+lightgbm==4.1.0       ← load lgbm_ranker.txt, predict
+faiss-cpu==1.7.4      ← query FAISS index (retrieval)
+pandas==2.1.0         ← xử lý features
+numpy==1.24.0         ← dot product embeddings
+redis==5.0.0          ← query Redis cache (popular items, similar items)
+boto3==1.34.0         ← load artifacts từ S3 lúc startup

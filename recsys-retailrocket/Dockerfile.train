@@ -1,0 +1,27 @@
+# ============================================
+# TRAINING IMAGE
+# Chứa: feature engineering + model training code + dependencies
+# Dùng bởi: Kubeflow pipeline khi cần retrain
+# Build: docker build -f Dockerfile.train -t recsys-train:v1.0 .
+# ============================================
+
+FROM python:3.11-slim
+
+# System dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python dependencies
+COPY requirements-train.txt /app/requirements-train.txt
+RUN pip install --no-cache-dir -r /app/requirements-train.txt
+
+# Copy source code
+COPY src/ /app/src/
+COPY configs/ /app/configs/
+
+WORKDIR /app
+
+# Entrypoint: Kubeflow sẽ override CMD cho từng step
+# Ví dụ: docker run recsys-train:v1.0 python src/feature_engineer/features.py
+CMD ["python", "--version"]

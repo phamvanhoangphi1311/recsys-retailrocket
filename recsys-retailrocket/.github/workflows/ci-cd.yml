@@ -1,0 +1,135 @@
+# ============================================
+# CI/CD PIPELINE — GitHub Actions
+# File này nằm trong repo. GitHub tự động chạy khi push.
+#
+# Trigger: push lên main
+# Flow:
+#   1. Checkout code
+#   2. Run tests (CI)
+#   3. If tests pass → build Docker images (CD)
+#   4. Push images lên ECR
+#   5. If training code changed → trigger Kubeflow retrain
+# ============================================
+
+name: CI/CD Pipeline
+
+# KHI NÀO CHẠY
+on:
+  push:
+    branches: [main]    # chỉ chạy khi push lên main
+  pull_request:
+    branches: [main]    # chạy khi tạo PR vào main (chỉ CI, không CD)
+
+# BIẾN MÔI TRƯỜNG
+env:
+  AWS_REGION: ap-southeast-1
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.ap-southeast-1.amazonaws.com
+
+jobs:
+  # ==========================================
+  # JOB 1: TEST (CI)
+  # Chạy MỌI LÚC — cả push và PR
+  # ==========================================
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install test dependencies
+        run: |
+          pip install pytest fastapi httpx uvicorn lightgbm
+
+      - name: Run tests
+        run: |
+          python -m pytest tests/ -v
+
+  # ==========================================
+  # JOB 2: BUILD + PUSH IMAGES (CD)
+  # Chạy CHỈ KHI push lên main (không chạy cho PR)
+  # Chạy CHỈ KHI tests pass (needs: test)
+  # ==========================================
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: test                           # ← đợi test pass
+    if: github.event_name == 'push'       # ← chỉ khi push, không phải PR
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2    # cần 2 commits để detect changed files
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Get version tag
+        id: version
+        run: echo "tag=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      # --- Detect WHAT changed ---
+      - name: Detect changed files
+        id: changes
+        run: |
+          # So sánh commit hiện tại với commit trước
+          CHANGED=$(git diff --name-only HEAD~1 HEAD)
+          echo "Changed files:"
+          echo "$CHANGED"
+          
+          # Check nếu training code thay đổi
+          if echo "$CHANGED" | grep -q "^src/\|^configs/\|^requirements-train"; then
+            echo "training_changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "training_changed=false" >> $GITHUB_OUTPUT
+          fi
+          
+          # Check nếu serving code thay đổi
+          if echo "$CHANGED" | grep -q "^api_gateway/"; then
+            echo "serving_changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "serving_changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      # --- Build + Push training image (chỉ khi training code đổi) ---
+      - name: Build & Push training image
+        if: steps.changes.outputs.training_changed == 'true'
+        run: |
+          docker build -f Dockerfile.train -t $ECR_REGISTRY/recsys-train:${{ steps.version.outputs.tag }} .
+          docker push $ECR_REGISTRY/recsys-train:${{ steps.version.outputs.tag }}
+          echo "✅ Training image pushed: recsys-train:${{ steps.version.outputs.tag }}"
+
+      # --- Build + Push serving image (chỉ khi serving code đổi) ---
+      - name: Build & Push serving image
+        if: steps.changes.outputs.serving_changed == 'true'
+        run: |
+          docker build -f api_gateway/Dockerfile -t $ECR_REGISTRY/recsys-serve:${{ steps.version.outputs.tag }} .
+          docker push $ECR_REGISTRY/recsys-serve:${{ steps.version.outputs.tag }}
+          echo "✅ Serving image pushed: recsys-serve:${{ steps.version.outputs.tag }}"
+
+  # ==========================================
+  # JOB 3: TRIGGER RETRAIN (chỉ khi training code đổi)
+  # ==========================================
+  trigger-retrain:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: needs.build-and-push.outputs.training_changed == 'true'
+    
+    steps:
+      - name: Trigger Kubeflow pipeline
+        run: |
+          echo "TODO: call Kubeflow API to trigger retraining pipeline"
+          # curl -X POST https://kubeflow.your-domain.com/api/v1/runs \
+          #   -H "Authorization: Bearer ${{ secrets.KF_TOKEN }}" \
+          #   -d '{"pipeline_id": "recsys-train", "image_tag": "${{ needs.build-and-push.outputs.tag }}"}'
