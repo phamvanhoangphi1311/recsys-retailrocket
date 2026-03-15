@@ -1,0 +1,62 @@
+# .github/workflows/ci-cd.yml
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install ALL dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install gensim faiss-cpu lightgbm
+          pip install fastapi httpx uvicorn pytest pandas numpy scikit-learn
+
+      - name: Run ALL tests
+        run: python -m pytest tests/ -v --tb=short
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' && needs.test.result == 'success'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-southeast-1
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & Push
+        run: |
+          TAG=$(git rev-parse --short HEAD)
+          docker build -f Dockerfile.train -t ${{ secrets.ECR_REGISTRY }}/recsys-train:$TAG .
+          docker build -f api_gateway/Dockerfile -t ${{ secrets.ECR_REGISTRY }}/recsys-serve:$TAG .
+          docker push ${{ secrets.ECR_REGISTRY }}/recsys-train:$TAG
+          docker push ${{ secrets.ECR_REGISTRY }}/recsys-serve:$TAG
+```
+
+Trick: `--index-url https://download.pytorch.org/whl/cpu` install torch **CPU-only** = 200MB thay vì 2GB. Tests không cần GPU.
+
+### Flow:
+```
+Local (conda env):
+  39 tests ALL RUN → 0 failed → push code
+
+GitHub Actions:
+  Install torch(cpu) + gensim + faiss (~3 phút)
+  39 tests ALL RUN → 0 failed → build images → push ECR
