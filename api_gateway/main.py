@@ -88,4 +88,4 @@ async def infer(user_id: str, k: int = 20):
         "is_warm_user": is_warm,
         "recommendations": candidates,
         "n_recommendations": len(candidates),
-    }
+    }# initial build
