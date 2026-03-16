@@ -18,7 +18,6 @@ RUN pip install --no-cache-dir -r /app/requirements-train.txt
 
 # Copy source code
 COPY src/ /app/src/
-COPY configs/ /app/configs/
 
 WORKDIR /app
 
