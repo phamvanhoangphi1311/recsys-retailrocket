@@ -1,3 +1,14 @@
+# =================================================================
+# CI/CD PIPELINE — RecSys RetailRocket (GCP)
+# =================================================================
+# Flow:
+#   1. Push code → run tests
+#   2. Detect which files changed
+#   3. Build ONLY affected images → push Artifact Registry
+#   4. Notify Discord (pass/fail + what was built)
+#   5. If training code changed → trigger Kubeflow retrain
+# =================================================================
+
 name: CI/CD Pipeline
 
 on:
@@ -7,6 +18,9 @@ on:
     branches: [main]
 
 jobs:
+  # ===============================================================
+  # JOB 1: TEST
+  # ===============================================================
   test:
     runs-on: ubuntu-latest
     steps:
@@ -25,6 +39,9 @@ jobs:
       - name: Run tests
         run: python -m pytest tests/ -v --tb=short
 
+  # ===============================================================
+  # JOB 2: DETECT CHANGES
+  # ===============================================================
   detect-changes:
     runs-on: ubuntu-latest
     needs: test
@@ -51,7 +68,7 @@ jobs:
             echo "train_changed=false" >> $GITHUB_OUTPUT
           fi
 
-          if echo "$CHANGED" | grep -qE "^src/feature_engineer/|^src/data_pipeline/|^Dockerfile.feature|^requirements-feature"; then
+          if echo "$CHANGED" | grep -qE "^src/feature_engineer/|^Dockerfile.feature|^requirements-feature"; then
             echo "feature_changed=true" >> $GITHUB_OUTPUT
           else
             echo "feature_changed=false" >> $GITHUB_OUTPUT
@@ -63,28 +80,26 @@ jobs:
             echo "serve_changed=false" >> $GITHUB_OUTPUT
           fi
 
+  # ===============================================================
+  # JOB 3-5: BUILD IMAGES (selective)
+  # ===============================================================
   build-train:
     runs-on: ubuntu-latest
     needs: detect-changes
     if: needs.detect-changes.outputs.train_changed == 'true'
     steps:
       - uses: actions/checkout@v4
-
-      - name: Auth GCP
-        uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
-
-      - name: Setup Docker for Artifact Registry
-        run: gcloud auth configure-docker ${{ secrets.GCP_REGION }}-docker.pkg.dev --quiet
-
+      - run: gcloud auth configure-docker ${{ secrets.GCP_REGION }}-docker.pkg.dev --quiet
       - name: Build and push training image
         run: |
           TAG=$(git rev-parse --short HEAD)
           REGISTRY=${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/recsys
-          docker build -f Dockerfile.train -t $REGISTRY/recsys-train:$TAG .
+          docker build -f Dockerfile.train -t $REGISTRY/recsys-train:$TAG -t $REGISTRY/recsys-train:latest .
           docker push $REGISTRY/recsys-train:$TAG
-          echo "Pushed recsys-train:$TAG"
+          docker push $REGISTRY/recsys-train:latest
 
   build-feature:
     runs-on: ubuntu-latest
@@ -92,22 +107,17 @@ jobs:
     if: needs.detect-changes.outputs.feature_changed == 'true'
     steps:
       - uses: actions/checkout@v4
-
-      - name: Auth GCP
-        uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
-
-      - name: Setup Docker for Artifact Registry
-        run: gcloud auth configure-docker ${{ secrets.GCP_REGION }}-docker.pkg.dev --quiet
-
+      - run: gcloud auth configure-docker ${{ secrets.GCP_REGION }}-docker.pkg.dev --quiet
       - name: Build and push feature image
         run: |
           TAG=$(git rev-parse --short HEAD)
           REGISTRY=${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/recsys
-          docker build -f Dockerfile.feature -t $REGISTRY/recsys-feature:$TAG .
+          docker build -f Dockerfile.feature -t $REGISTRY/recsys-feature:$TAG -t $REGISTRY/recsys-feature:latest .
           docker push $REGISTRY/recsys-feature:$TAG
-          echo "Pushed recsys-feature:$TAG"
+          docker push $REGISTRY/recsys-feature:latest
 
   build-serve:
     runs-on: ubuntu-latest
@@ -115,19 +125,124 @@ jobs:
     if: needs.detect-changes.outputs.serve_changed == 'true'
     steps:
       - uses: actions/checkout@v4
-
-      - name: Auth GCP
-        uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
-
-      - name: Setup Docker for Artifact Registry
-        run: gcloud auth configure-docker ${{ secrets.GCP_REGION }}-docker.pkg.dev --quiet
-
+      - run: gcloud auth configure-docker ${{ secrets.GCP_REGION }}-docker.pkg.dev --quiet
       - name: Build and push serving image
         run: |
           TAG=$(git rev-parse --short HEAD)
           REGISTRY=${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/recsys
-          docker build -f api_gateway/Dockerfile -t $REGISTRY/recsys-serve:$TAG .
+          docker build -f api_gateway/Dockerfile -t $REGISTRY/recsys-serve:$TAG -t $REGISTRY/recsys-serve:latest .
           docker push $REGISTRY/recsys-serve:$TAG
-          echo "Pushed recsys-serve:$TAG"
+          docker push $REGISTRY/recsys-serve:latest
+
+  # ===============================================================
+  # JOB 6: NOTIFY DISCORD
+  # Chạy SAU tất cả build jobs (kể cả skip)
+  # Gửi: test result + images built + commit info
+  # ===============================================================
+  notify:
+    runs-on: ubuntu-latest
+    needs: [test, detect-changes, build-train, build-feature, build-serve]
+    if: always() && github.event_name == 'push'
+    steps:
+      - name: Send Discord notification
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TEST_RESULT: ${{ needs.test.result }}
+          TRAIN_CHANGED: ${{ needs.detect-changes.outputs.train_changed }}
+          FEATURE_CHANGED: ${{ needs.detect-changes.outputs.feature_changed }}
+          SERVE_CHANGED: ${{ needs.detect-changes.outputs.serve_changed }}
+          BUILD_TRAIN: ${{ needs.build-train.result }}
+          BUILD_FEATURE: ${{ needs.build-feature.result }}
+          BUILD_SERVE: ${{ needs.build-serve.result }}
+        run: |
+          # Build status summary
+          if [ "$TEST_RESULT" = "success" ]; then
+            STATUS_EMOJI="✅"
+            STATUS_TEXT="Tests passed"
+            COLOR=3066993
+          else
+            STATUS_EMOJI="❌"
+            STATUS_TEXT="Tests FAILED"
+            COLOR=15158332
+          fi
+
+          # Which images were built
+          IMAGES_BUILT=""
+          if [ "$TRAIN_CHANGED" = "true" ]; then
+            if [ "$BUILD_TRAIN" = "success" ]; then
+              IMAGES_BUILT="${IMAGES_BUILT}✅ recsys-train\n"
+            else
+              IMAGES_BUILT="${IMAGES_BUILT}❌ recsys-train FAILED\n"
+            fi
+          fi
+          if [ "$FEATURE_CHANGED" = "true" ]; then
+            if [ "$BUILD_FEATURE" = "success" ]; then
+              IMAGES_BUILT="${IMAGES_BUILT}✅ recsys-feature\n"
+            else
+              IMAGES_BUILT="${IMAGES_BUILT}❌ recsys-feature FAILED\n"
+            fi
+          fi
+          if [ "$SERVE_CHANGED" = "true" ]; then
+            if [ "$BUILD_SERVE" = "success" ]; then
+              IMAGES_BUILT="${IMAGES_BUILT}✅ recsys-serve\n"
+            else
+              IMAGES_BUILT="${IMAGES_BUILT}❌ recsys-serve FAILED\n"
+            fi
+          fi
+          if [ -z "$IMAGES_BUILT" ]; then
+            IMAGES_BUILT="No images rebuilt (no relevant code changes)"
+          fi
+
+          # Send to Discord
+          curl -H "Content-Type: application/json" \
+            -d "{
+              \"embeds\": [{
+                \"title\": \"${STATUS_EMOJI} CI/CD: ${STATUS_TEXT}\",
+                \"color\": ${COLOR},
+                \"fields\": [
+                  {\"name\": \"Commit\", \"value\": \"${{ github.event.head_commit.message }}\", \"inline\": false},
+                  {\"name\": \"Author\", \"value\": \"${{ github.actor }}\", \"inline\": true},
+                  {\"name\": \"Branch\", \"value\": \"${{ github.ref_name }}\", \"inline\": true},
+                  {\"name\": \"Images\", \"value\": \"${IMAGES_BUILT}\", \"inline\": false}
+                ],
+                \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+              }]
+            }" \
+            "$DISCORD_WEBHOOK"
+
+  # # ===============================================================
+  # # JOB 7: TRIGGER KUBEFLOW RETRAIN
+  # # CHỈ chạy khi training image mới build THÀNH CÔNG
+  # # Gọi Kubeflow API → start training pipeline
+  # # ===============================================================
+  # trigger-retrain:
+  #   runs-on: ubuntu-latest
+  #   needs: [build-train, detect-changes]
+  #   if: needs.detect-changes.outputs.train_changed == 'true' && needs.build-train.result == 'success'
+  #   steps:
+  #     - name: Trigger Kubeflow pipeline
+  #       env:
+  #         KUBEFLOW_HOST: ${{ secrets.KUBEFLOW_HOST }}
+  #         KUBEFLOW_TOKEN: ${{ secrets.KUBEFLOW_TOKEN }}
+  #         IMAGE_TAG: ${{ github.sha }}
+  #       run: |
+  #         if [ -z "$KUBEFLOW_HOST" ]; then
+  #           echo "Kubeflow not configured yet. Skipping retrain trigger."
+  #           echo "When ready, add KUBEFLOW_HOST and KUBEFLOW_TOKEN secrets."
+  #           exit 0
+  #         fi
+
+  #         echo "Triggering Kubeflow pipeline..."
+  #         curl -X POST "${KUBEFLOW_HOST}/api/v1/runs" \
+  #           -H "Authorization: Bearer ${KUBEFLOW_TOKEN}" \
+  #           -H "Content-Type: application/json" \
+  #           -d "{
+  #             \"pipeline_id\": \"recsys-training\",
+  #             \"params\": {
+  #               \"image_tag\": \"${IMAGE_TAG}\"
+  #             }
+  #           }"
+  #         echo "Retrain triggered."
