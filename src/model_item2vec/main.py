@@ -138,3 +138,4 @@ print(f"✅ item2vec_embeddings.npy: {embeddings.shape}")
 print(f"✅ item2vec_item2idx.json: {len(item2emb_idx):,} items")
 print(f"\n✅ STEP 4 COMPLETE")# initial build
 # initial build
+# initial build
