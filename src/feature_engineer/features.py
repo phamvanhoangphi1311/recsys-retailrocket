@@ -635,3 +635,4 @@ print(f"✅ user_item_pairs_raw.parquet: {len(user_item):,} pairs")
 
 print(f"\n✅ FULL EDA COMPLETE — events df is FINAL")
 print(f"   Next: Step 2 (label design + temporal split + save train/val/test)")# initial build
+# initial build

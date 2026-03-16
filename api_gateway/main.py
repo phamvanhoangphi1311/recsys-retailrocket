@@ -89,3 +89,4 @@ async def infer(user_id: str, k: int = 20):
         "recommendations": candidates,
         "n_recommendations": len(candidates),
     }# initial build
+# initial build
